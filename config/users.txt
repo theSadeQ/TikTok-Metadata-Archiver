@@ -1,0 +1,6 @@
+# Add TikTok usernames below (one per line)
+# Leading '@' will be ignored automatically.
+# Blank lines and lines starting with '#' are ignored.
+
+tiktok
+@tiktokcreators
