@@ -15,7 +15,7 @@ An automated tool powered by GitHub Actions and `yt-dlp` to continuously monitor
 
 ### 1. Adding Users
 Simply edit `config/users.txt` and add the TikTok handles you want to track (one per line).
-```text
+text
 tiktok
 tiktokcreators
 
@@ -61,7 +61,7 @@ python scripts/collect_tiktok_metadata.py
 * **yt-dlp Maintenance**: Web structures change frequently. Keep `yt-dlp` up to date in the `requirements.txt` to ensure uninterrupted extraction.
 
 
----
+
 
 ### Data Flow Overview
 1. **Input**: The script reads user lists and configs. 
