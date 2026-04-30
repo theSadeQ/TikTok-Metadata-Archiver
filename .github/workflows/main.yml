@@ -1,0 +1,147 @@
+name: Scrape TikTok Video IDs
+
+on:
+  workflow_dispatch:
+    inputs:
+      usernames:
+        description: "Comma-separated TikTok usernames. Example: user1,user2,@user3,https://www.tiktok.com/@user4"
+        required: true
+        type: string
+
+jobs:
+  scrape:
+    name: Extract TikTok video URLs
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install yt-dlp
+
+      - name: Extract video URLs for multiple users
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RAW_INPUT="${{ inputs.usernames }}"
+          OUTPUT_DIR="outputs"
+
+          mkdir -p "$OUTPUT_DIR"
+
+          # Split input by commas
+          IFS=',' read -ra USER_LIST <<< "$RAW_INPUT"
+
+          SUCCESS_COUNT=0
+          FAIL_COUNT=0
+
+          for RAW_USER in "${USER_LIST[@]}"; do
+            # Normalize each entry:
+            # - allow plain username
+            # - allow @username
+            # - allow full TikTok profile URL
+            USERNAME="$(printf '%s' "$RAW_USER" \
+              | sed -E 's#https?://(www\.)?tiktok\.com/@##' \
+              | sed -E 's#/.*$##' \
+              | sed 's#^@##' \
+              | sed 's#/$##' \
+              | xargs)"
+
+            if [ -z "$USERNAME" ]; then
+              echo "Skipping empty username entry: '$RAW_USER'"
+              FAIL_COUNT=$((FAIL_COUNT + 1))
+              continue
+            fi
+
+            PROFILE_URL="https://www.tiktok.com/@$USERNAME"
+            OUTPUT_FILE="$OUTPUT_DIR/${USERNAME}_video_urls.txt"
+            TEMP_IDS_FILE="$(mktemp)"
+
+            echo "----------------------------------------"
+            echo "Processing username: $USERNAME"
+            echo "Profile URL: $PROFILE_URL"
+            echo "Output file: $OUTPUT_FILE"
+
+            # Extract flat playlist video IDs
+            if ! yt-dlp --flat-playlist --print id "$PROFILE_URL" > "$TEMP_IDS_FILE"; then
+              echo "Error: failed to extract video IDs for '$USERNAME'"
+              rm -f "$TEMP_IDS_FILE"
+              FAIL_COUNT=$((FAIL_COUNT + 1))
+              continue
+            fi
+
+            if [ ! -s "$TEMP_IDS_FILE" ]; then
+              echo "Warning: no video IDs found for '$USERNAME'"
+              rm -f "$TEMP_IDS_FILE"
+              FAIL_COUNT=$((FAIL_COUNT + 1))
+              continue
+            fi
+
+            # Convert IDs to full TikTok video URLs
+            sed "s#^#https://www.tiktok.com/@$USERNAME/video/#" "$TEMP_IDS_FILE" > "$OUTPUT_FILE"
+
+            COUNT="$(wc -l < "$OUTPUT_FILE" | tr -d '[:space:]')"
+            echo "Saved $COUNT video URLs to $OUTPUT_FILE"
+
+            rm -f "$TEMP_IDS_FILE"
+            SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+          done
+
+          echo "----------------------------------------"
+          echo "Finished processing."
+          echo "Successful users: $SUCCESS_COUNT"
+          echo "Failed/skipped users: $FAIL_COUNT"
+
+          # Fail workflow only if no user succeeded
+          if [ "$SUCCESS_COUNT" -eq 0 ]; then
+            echo "Error: no users were processed successfully."
+            exit 1
+          fi
+
+      - name: Commit and push output files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          shopt -s nullglob
+          FILES=(outputs/*.txt)
+
+          if [ ${#FILES[@]} -eq 0 ]; then
+            echo "No output files found to commit."
+            exit 0
+          fi
+
+          git add outputs/*.txt
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Add TikTok video URLs for multiple users"
+          git push
+
+      - name: Upload output as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tiktok-video-urls
+          path: outputs/*.txt
+          retention-days: 7
