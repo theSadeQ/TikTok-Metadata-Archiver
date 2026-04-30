@@ -45,7 +45,7 @@ jobs:
       - name: Run TikTok Profile Picture Downloader
         run: |
           python scripts/download_tiktok_profile_pictures.py \
-            --input users.txt \
+            --input config/users.txt \
             --output-dir data/profile_pictures \
             --cookies cookies.txt
 
