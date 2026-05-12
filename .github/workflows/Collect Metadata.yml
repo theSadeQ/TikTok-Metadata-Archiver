@@ -1,7 +1,6 @@
 name: Collect TikTok Metadata
 
 on:
-  # Manual trigger with optional user override
   workflow_dispatch:
     inputs:
       usernames:
@@ -10,7 +9,6 @@ on:
         default: ""
         type: string
 
-  # Scheduled: runs every day at 00:00 UTC
   schedule:
     - cron: "0 0 * * *"
 
@@ -37,7 +35,6 @@ jobs:
         with:
           python-version: "3.12"
 
-      # Fix 3: Cache uv packages so repeated runs skip re-downloading yt-dlp
       - name: Cache uv packages
         uses: actions/cache@v4
         with:
@@ -46,30 +43,39 @@ jobs:
           restore-keys: |
             uv-${{ runner.os }}-
 
-      - name: Install dependencies with uv
+      - name: Install dependencies with uv (venv)
         shell: bash
         run: |
           set -euo pipefail
           curl -LsSf https://astral.sh/uv/install.sh | sh
           export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
-          uv pip install --system --upgrade -r requirements.txt
-          echo "yt-dlp version: $(yt-dlp --version)"
+          uv venv "$HOME/.venv"
+          uv pip install --python "$HOME/.venv/bin/python" --upgrade -r requirements.txt
+          echo "$HOME/.venv/bin" >> "$GITHUB_PATH"
+          echo "yt-dlp version: $("$HOME/.venv/bin/yt-dlp" --version)"
 
       - name: Run metadata collection
         shell: bash
         env:
           TIKTOK_COOKIES_B64: ${{ secrets.TIKTOK_COOKIES_B64 }}
         run: |
-          set -euo pipefail
+          set +e
+          set +u
 
-          # Decode cookies if provided
+          echo "[*] Python: $(python --version 2>&1)"
+          echo "[*] yt-dlp: $(yt-dlp --version 2>&1)"
+          echo "[*] Working dir: $(pwd)"
+          echo "[*] config/users.txt exists: $([ -f config/users.txt ] && echo YES || echo NO)"
+          echo "[*] scripts/collect_tiktok_metadata.py exists: $([ -f scripts/collect_tiktok_metadata.py ] && echo YES || echo NO)"
+
           if [ -n "${TIKTOK_COOKIES_B64:-}" ]; then
             echo "$TIKTOK_COOKIES_B64" | base64 -d > cookies.txt
             chmod 600 cookies.txt
             echo "[*] Cookies loaded."
+          else
+            echo "[*] No cookies secret provided."
           fi
 
-          # Fix 4: Pass CLI --users override if provided via workflow_dispatch input
           USERS_ARG=""
           if [ -n "${{ inputs.usernames }}" ]; then
             USERS_ARG="--users \"${{ inputs.usernames }}\""
@@ -78,7 +84,16 @@ jobs:
             echo "[*] Using config/users.txt"
           fi
 
+          echo "[*] Running: python scripts/collect_tiktok_metadata.py $USERS_ARG"
           eval python scripts/collect_tiktok_metadata.py $USERS_ARG
+          EXIT_CODE=$?
+
+          echo "[*] Script exit code: $EXIT_CODE"
+
+          if [ $EXIT_CODE -ne 0 ]; then
+            echo "[!] collect_tiktok_metadata.py failed with exit code $EXIT_CODE"
+            exit $EXIT_CODE
+          fi
 
       - name: Commit and push data files
         shell: bash

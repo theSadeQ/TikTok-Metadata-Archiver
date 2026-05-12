@@ -31,32 +31,44 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install dependencies with uv
+      - name: Install dependencies with uv (venv)
         shell: bash
         run: |
           set -euo pipefail
           curl -LsSf https://astral.sh/uv/install.sh | sh
           export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
-          uv pip install --system --upgrade yt-dlp
-          echo "yt-dlp version: $(yt-dlp --version)"
+          uv venv "$HOME/.venv"
+          uv pip install --python "$HOME/.venv/bin/python" --upgrade yt-dlp
+          echo "$HOME/.venv/bin" >> "$GITHUB_PATH"
+          echo "yt-dlp version: $("$HOME/.venv/bin/yt-dlp" --version)"
 
       - name: Extract video URLs in parallel
         shell: bash
         run: |
-          set -euo pipefail
+          # Tolerant mode: log errors but don't abort on first failure
+          set +e
+          set +u
+          set -o pipefail
 
           RAW_INPUT="${{ inputs.usernames }}"
           OUTPUT_DIR="outputs"
           TMP_DIR="$(mktemp -d)"
+          DEBUG_LOG="$TMP_DIR/debug.log"
 
           mkdir -p "$OUTPUT_DIR"
+          touch "$DEBUG_LOG"
+
+          log() {
+            echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] $*" | tee -a "$DEBUG_LOG"
+          }
+
+          log "Starting scrape"
+          log "Raw input: $RAW_INPUT"
+          log "yt-dlp: $(yt-dlp --version 2>&1)"
 
           IFS=',' read -ra USER_LIST <<< "$RAW_INPUT"
+          log "Total users to process: ${#USER_LIST[@]}"
 
-          # -------------------------------------------------------
-          # PHASE 1 — launch all yt-dlp scrapes in parallel
-          # Each user writes to its own temp file inside TMP_DIR.
-          # -------------------------------------------------------
           declare -A INDEX_TO_USER
           PIDS=()
           INDEX=0
@@ -70,26 +82,39 @@ jobs:
               | xargs)"
 
             if [ -z "$USERNAME" ]; then
-              echo "Skipping empty username entry: '$RAW_USER'"
+              log "Skipping empty entry: '$RAW_USER'"
               INDEX=$((INDEX + 1))
               continue
             fi
 
             INDEX_TO_USER["$INDEX"]="$USERNAME"
-
             PROFILE_URL="https://www.tiktok.com/@$USERNAME"
             TEMP_IDS_FILE="$TMP_DIR/ids_$INDEX.txt"
+            JOB_LOG="$TMP_DIR/job_${INDEX}.log"
 
-            echo "Launching scrape #$INDEX: $USERNAME"
+            log "Launching scrape #$INDEX: $USERNAME ($PROFILE_URL)"
 
             (
-              if yt-dlp --flat-playlist --print id "$PROFILE_URL" > "$TEMP_IDS_FILE" 2>&1; then
-                echo "[OK] $USERNAME"
-              else
-                # Write empty file so phase 2 can detect failure
-                echo "[FAIL] $USERNAME" >&2
+              echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] Starting yt-dlp for $USERNAME" >> "$JOB_LOG"
+
+              yt-dlp \
+                --flat-playlist \
+                --print id \
+                --verbose \
+                "$PROFILE_URL" \
+                > "$TEMP_IDS_FILE" \
+                2>> "$JOB_LOG"
+
+              EXIT_CODE=$?
+              echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] yt-dlp exit code: $EXIT_CODE" >> "$JOB_LOG"
+
+              if [ $EXIT_CODE -ne 0 ]; then
+                echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] FAILED: $USERNAME" >> "$JOB_LOG"
                 rm -f "$TEMP_IDS_FILE"
                 touch "$TEMP_IDS_FILE.failed"
+              else
+                LINE_COUNT=$(wc -l < "$TEMP_IDS_FILE" 2>/dev/null || echo 0)
+                echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] OK: $USERNAME — $LINE_COUNT IDs" >> "$JOB_LOG"
               fi
             ) &
 
@@ -97,15 +122,23 @@ jobs:
             INDEX=$((INDEX + 1))
           done
 
-          echo "Waiting for all ${#PIDS[@]} scrape job(s) to finish..."
+          log "Waiting for all ${#PIDS[@]} job(s)..."
           for pid in "${PIDS[@]}"; do
             wait "$pid"
           done
-          echo "All scrapes finished."
+          log "All scrapes finished."
 
-          # -------------------------------------------------------
-          # PHASE 2 — serial result collection and file writing
-          # -------------------------------------------------------
+          # Dump all per-job logs into main output
+          echo ""
+          echo "===== PER-JOB LOGS ====="
+          for logfile in "$TMP_DIR"/job_*.log; do
+            [ -f "$logfile" ] || continue
+            echo "--- $(basename "$logfile") ---"
+            cat "$logfile"
+            echo ""
+          done
+          echo "========================"
+
           SUCCESS_COUNT=0
           FAIL_COUNT=0
 
@@ -114,36 +147,30 @@ jobs:
             TEMP_IDS_FILE="$TMP_DIR/ids_$i.txt"
             OUTPUT_FILE="$OUTPUT_DIR/${USERNAME}_video_urls.txt"
 
-            echo "----------------------------------------"
-            echo "Processing result #$i: $USERNAME"
+            log "Processing result #$i: $USERNAME"
 
             if [ -f "$TEMP_IDS_FILE.failed" ] || [ ! -f "$TEMP_IDS_FILE" ]; then
-              echo "Error: failed to extract video IDs for '$USERNAME'"
+              log "ERROR: failed or missing output for $USERNAME"
               FAIL_COUNT=$((FAIL_COUNT + 1))
               continue
             fi
 
             if [ ! -s "$TEMP_IDS_FILE" ]; then
-              echo "Warning: no video IDs found for '$USERNAME'"
+              log "WARNING: empty result for $USERNAME (0 IDs found)"
               FAIL_COUNT=$((FAIL_COUNT + 1))
               continue
             fi
 
             sed "s#^#https://www.tiktok.com/@$USERNAME/video/#" "$TEMP_IDS_FILE" > "$OUTPUT_FILE"
-
             COUNT="$(wc -l < "$OUTPUT_FILE" | tr -d '[:space:]')"
-            echo "Saved $COUNT video URLs to $OUTPUT_FILE"
-
+            log "Saved $COUNT video URLs -> $OUTPUT_FILE"
             SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
           done
 
-          echo "----------------------------------------"
-          echo "Finished processing."
-          echo "Successful users: $SUCCESS_COUNT"
-          echo "Failed/skipped users: $FAIL_COUNT"
+          log "Summary: $SUCCESS_COUNT succeeded, $FAIL_COUNT failed"
 
           if [ "$SUCCESS_COUNT" -eq 0 ]; then
-            echo "Error: no users were processed successfully."
+            log "FATAL: no users processed successfully."
             exit 1
           fi
 
