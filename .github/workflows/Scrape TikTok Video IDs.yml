@@ -8,6 +8,10 @@ on:
         required: true
         type: string
 
+concurrency:
+  group: tiktok-metadata-scrape
+  cancel-in-progress: false
+
 jobs:
   scrape:
     name: Extract TikTok video URLs
@@ -27,34 +31,37 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install dependencies
+      - name: Install dependencies with uv
         shell: bash
         run: |
           set -euo pipefail
-          python -m pip install --upgrade pip
-          pip install yt-dlp
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+          uv pip install --system --upgrade yt-dlp
+          echo "yt-dlp version: $(yt-dlp --version)"
 
-      - name: Extract video URLs for multiple users
+      - name: Extract video URLs in parallel
         shell: bash
         run: |
           set -euo pipefail
 
           RAW_INPUT="${{ inputs.usernames }}"
           OUTPUT_DIR="outputs"
+          TMP_DIR="$(mktemp -d)"
 
           mkdir -p "$OUTPUT_DIR"
 
-          # Split input by commas
           IFS=',' read -ra USER_LIST <<< "$RAW_INPUT"
 
-          SUCCESS_COUNT=0
-          FAIL_COUNT=0
+          # -------------------------------------------------------
+          # PHASE 1 — launch all yt-dlp scrapes in parallel
+          # Each user writes to its own temp file inside TMP_DIR.
+          # -------------------------------------------------------
+          declare -A INDEX_TO_USER
+          PIDS=()
+          INDEX=0
 
           for RAW_USER in "${USER_LIST[@]}"; do
-            # Normalize each entry:
-            # - allow plain username
-            # - allow @username
-            # - allow full TikTok profile URL
             USERNAME="$(printf '%s' "$RAW_USER" \
               | sed -E 's#https?://(www\.)?tiktok\.com/@##' \
               | sed -E 's#/.*$##' \
@@ -64,41 +71,69 @@ jobs:
 
             if [ -z "$USERNAME" ]; then
               echo "Skipping empty username entry: '$RAW_USER'"
-              FAIL_COUNT=$((FAIL_COUNT + 1))
+              INDEX=$((INDEX + 1))
               continue
             fi
 
+            INDEX_TO_USER["$INDEX"]="$USERNAME"
+
             PROFILE_URL="https://www.tiktok.com/@$USERNAME"
+            TEMP_IDS_FILE="$TMP_DIR/ids_$INDEX.txt"
+
+            echo "Launching scrape #$INDEX: $USERNAME"
+
+            (
+              if yt-dlp --flat-playlist --print id "$PROFILE_URL" > "$TEMP_IDS_FILE" 2>&1; then
+                echo "[OK] $USERNAME"
+              else
+                # Write empty file so phase 2 can detect failure
+                echo "[FAIL] $USERNAME" >&2
+                rm -f "$TEMP_IDS_FILE"
+                touch "$TEMP_IDS_FILE.failed"
+              fi
+            ) &
+
+            PIDS+=($!)
+            INDEX=$((INDEX + 1))
+          done
+
+          echo "Waiting for all ${#PIDS[@]} scrape job(s) to finish..."
+          for pid in "${PIDS[@]}"; do
+            wait "$pid"
+          done
+          echo "All scrapes finished."
+
+          # -------------------------------------------------------
+          # PHASE 2 — serial result collection and file writing
+          # -------------------------------------------------------
+          SUCCESS_COUNT=0
+          FAIL_COUNT=0
+
+          for i in "${!INDEX_TO_USER[@]}"; do
+            USERNAME="${INDEX_TO_USER[$i]}"
+            TEMP_IDS_FILE="$TMP_DIR/ids_$i.txt"
             OUTPUT_FILE="$OUTPUT_DIR/${USERNAME}_video_urls.txt"
-            TEMP_IDS_FILE="$(mktemp)"
 
             echo "----------------------------------------"
-            echo "Processing username: $USERNAME"
-            echo "Profile URL: $PROFILE_URL"
-            echo "Output file: $OUTPUT_FILE"
+            echo "Processing result #$i: $USERNAME"
 
-            # Extract flat playlist video IDs
-            if ! yt-dlp --flat-playlist --print id "$PROFILE_URL" > "$TEMP_IDS_FILE"; then
+            if [ -f "$TEMP_IDS_FILE.failed" ] || [ ! -f "$TEMP_IDS_FILE" ]; then
               echo "Error: failed to extract video IDs for '$USERNAME'"
-              rm -f "$TEMP_IDS_FILE"
               FAIL_COUNT=$((FAIL_COUNT + 1))
               continue
             fi
 
             if [ ! -s "$TEMP_IDS_FILE" ]; then
               echo "Warning: no video IDs found for '$USERNAME'"
-              rm -f "$TEMP_IDS_FILE"
               FAIL_COUNT=$((FAIL_COUNT + 1))
               continue
             fi
 
-            # Convert IDs to full TikTok video URLs
             sed "s#^#https://www.tiktok.com/@$USERNAME/video/#" "$TEMP_IDS_FILE" > "$OUTPUT_FILE"
 
             COUNT="$(wc -l < "$OUTPUT_FILE" | tr -d '[:space:]')"
             echo "Saved $COUNT video URLs to $OUTPUT_FILE"
 
-            rm -f "$TEMP_IDS_FILE"
             SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
           done
 
@@ -107,7 +142,6 @@ jobs:
           echo "Successful users: $SUCCESS_COUNT"
           echo "Failed/skipped users: $FAIL_COUNT"
 
-          # Fail workflow only if no user succeeded
           if [ "$SUCCESS_COUNT" -eq 0 ]; then
             echo "Error: no users were processed successfully."
             exit 1
@@ -136,7 +170,7 @@ jobs:
             exit 0
           fi
 
-          git commit -m "Add TikTok video URLs for multiple users"
+          git commit -m "Add TikTok video URLs for multiple users [skip ci]"
           git push
 
       - name: Upload output as artifact
