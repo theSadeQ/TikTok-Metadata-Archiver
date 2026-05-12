@@ -1,0 +1,106 @@
+name: Collect TikTok Metadata
+
+on:
+  # Manual trigger with optional user override
+  workflow_dispatch:
+    inputs:
+      usernames:
+        description: "Optional: comma-separated TikTok usernames to override config/users.txt"
+        required: false
+        default: ""
+        type: string
+
+  # Scheduled: runs every day at 00:00 UTC
+  schedule:
+    - cron: "0 0 * * *"
+
+concurrency:
+  group: tiktok-collect-metadata
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    name: Collect metadata and archive
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Fix 3: Cache uv packages so repeated runs skip re-downloading yt-dlp
+      - name: Cache uv packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            uv-${{ runner.os }}-
+
+      - name: Install dependencies with uv
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+          uv pip install --system --upgrade -r requirements.txt
+          echo "yt-dlp version: $(yt-dlp --version)"
+
+      - name: Run metadata collection
+        shell: bash
+        env:
+          TIKTOK_COOKIES_B64: ${{ secrets.TIKTOK_COOKIES_B64 }}
+        run: |
+          set -euo pipefail
+
+          # Decode cookies if provided
+          if [ -n "${TIKTOK_COOKIES_B64:-}" ]; then
+            echo "$TIKTOK_COOKIES_B64" | base64 -d > cookies.txt
+            chmod 600 cookies.txt
+            echo "[*] Cookies loaded."
+          fi
+
+          # Fix 4: Pass CLI --users override if provided via workflow_dispatch input
+          USERS_ARG=""
+          if [ -n "${{ inputs.usernames }}" ]; then
+            USERS_ARG="--users \"${{ inputs.usernames }}\""
+            echo "[*] Using workflow_dispatch usernames: ${{ inputs.usernames }}"
+          else
+            echo "[*] Using config/users.txt"
+          fi
+
+          eval python scripts/collect_tiktok_metadata.py $USERS_ARG
+
+      - name: Commit and push data files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add data/
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "chore: update TikTok metadata archive [skip ci]"
+          git push
+
+      - name: Upload data as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tiktok-metadata
+          path: data/
+          retention-days: 14
