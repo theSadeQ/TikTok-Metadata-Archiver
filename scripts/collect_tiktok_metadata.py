@@ -1,4 +1,5 @@
 import os
+import sys
 import json
 import subprocess
 import csv
@@ -54,21 +55,17 @@ def load_usernames():
 
 
 def fetch_user_data(username, settings):
-    """
-    Execute yt-dlp via subprocess.
-    Using subprocess provides strict isolation and prevents library-level
-    stdout pollution, making JSON extraction highly reliable.
-    Safe to call from multiple threads simultaneously.
-    """
     url = f"https://www.tiktok.com/@{username}"
 
+    # Use sys.executable so the subprocess always runs inside the same
+    # venv/interpreter that launched this script - fixes "module not found"
+    # errors when running inside a GitHub Actions uv venv.
     cmd = [
-        "python", "-m", "yt_dlp",
+        sys.executable, "-m", "yt_dlp",
         "--dump-single-json",
         "--no-flat-playlist",
         "--ignore-errors",
-        "--quiet",
-        "--no-warnings"
+        # Removed --quiet and --no-warnings so errors are visible in logs
     ]
 
     if os.path.exists("cookies.txt"):
@@ -80,12 +77,19 @@ def fetch_user_data(username, settings):
 
     cmd.append(url)
 
-    print(f"[*] Fetching metadata for @{username}...")
+    print(f"[*] Fetching metadata for @{username} using: {sys.executable}", flush=True)
+    print(f"[*] Command: {' '.join(cmd)}", flush=True)
+
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, check=False)
 
+        print(f"[*] @{username} exit code: {result.returncode}", flush=True)
+
+        if result.stderr.strip():
+            print(f"[*] @{username} stderr:\n{result.stderr[:2000]}", flush=True)
+
         if not result.stdout.strip():
-            print(f"[-] No data returned for @{username}. (stderr: {result.stderr[:200]})")
+            print(f"[-] No stdout for @{username}.", flush=True)
             return None
 
         raw_data = json.loads(result.stdout)
@@ -98,13 +102,15 @@ def fetch_user_data(username, settings):
             "collected_at": datetime.now(timezone.utc).isoformat(),
             "videos": extract_video_metadata(videos)
         }
+        print(f"[+] @{username}: {len(videos)} videos found.", flush=True)
         return user_obj
 
     except json.JSONDecodeError as e:
-        print(f"[-] Failed to parse JSON for @{username}: {e}")
+        print(f"[-] JSON parse error for @{username}: {e}", flush=True)
+        print(f"[-] Raw stdout (first 500 chars): {result.stdout[:500]}", flush=True)
         return {"username": username, "error": "JSONDecodeError", "collected_at": datetime.now(timezone.utc).isoformat()}
     except Exception as e:
-        print(f"[-] Unexpected error for @{username}: {e}")
+        print(f"[-] Unexpected error for @{username}: {e}", flush=True)
         return {"username": username, "error": str(e), "collected_at": datetime.now(timezone.utc).isoformat()}
 
 
@@ -164,7 +170,6 @@ def update_summary_csv(all_users_data):
 
 
 def main():
-    # --- Fix 4: CLI argument to override users.txt ---
     parser = argparse.ArgumentParser(description="Collect TikTok metadata via yt-dlp")
     parser.add_argument(
         "--users",
@@ -173,24 +178,25 @@ def main():
     )
     args = parser.parse_args()
 
+    print(f"[*] Python executable: {sys.executable}", flush=True)
+    print(f"[*] Python version: {sys.version}", flush=True)
+
     setup_directories()
     settings = load_settings()
 
     if args.users:
         usernames = [u.strip().lstrip("@") for u in args.users.split(",") if u.strip()]
-        print(f"[*] Using CLI-provided usernames: {usernames}")
+        print(f"[*] Using CLI-provided usernames: {usernames}", flush=True)
     else:
         usernames = load_usernames()
+        print(f"[*] Loaded {len(usernames)} username(s) from {USERS_FILE}", flush=True)
 
     if not usernames:
-        print("[-] No usernames found. Exiting.")
+        print("[-] No usernames found. Exiting.", flush=True)
         return
 
-    print(f"[*] Collecting metadata for {len(usernames)} user(s) in parallel...")
+    print(f"[*] Collecting metadata for {len(usernames)} user(s)...", flush=True)
 
-    # --- Fix 1: Parallel fetching with ThreadPoolExecutor ---
-    # sleep_seconds_between_users is no longer needed; removed.
-    # max_workers controls concurrency (default 5, configurable in settings.yml).
     max_workers = int(settings.get('max_workers', 5))
     all_data = []
 
@@ -201,19 +207,23 @@ def main():
         }
         for future in concurrent.futures.as_completed(futures):
             username = futures[future]
-            user_data = future.result()
+            try:
+                user_data = future.result()
+            except Exception as e:
+                print(f"[-] Thread exception for @{username}: {e}", flush=True)
+                continue
             if user_data:
                 user_file = os.path.join(USERS_DATA_DIR, f"{username}.json")
                 save_json(user_data, user_file)
                 all_data.append(user_data)
-                print(f"[+] Saved @{username} ({len(user_data.get('videos', []))} videos)")
+                print(f"[+] Saved @{username} ({len(user_data.get('videos', []))} videos)", flush=True)
 
     save_json(all_data, ALL_JSON_FILE)
-    print(f"[+] Saved aggregated data to {ALL_JSON_FILE}")
+    print(f"[+] Saved aggregated data to {ALL_JSON_FILE}", flush=True)
 
     update_summary_csv(all_data)
-    print(f"[+] Saved CSV summary to {SUMMARY_CSV_FILE}")
-    print("[+] Archival run complete!")
+    print(f"[+] Saved CSV summary to {SUMMARY_CSV_FILE}", flush=True)
+    print("[+] Archival run complete!", flush=True)
 
 
 if __name__ == "__main__":
